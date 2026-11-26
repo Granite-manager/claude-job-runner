@@ -19,10 +19,16 @@ if (( uptime_secs < MIN_UPTIME_SECS )); then
   exit 0
 fi
 
-# No answer: the runner is down or restarting. Leave the machine up so a
-# person can look; the boot grace above covers a slow start.
+# No answer: the runner is down, restarting or not set up. Give it the boot
+# grace plus the idle time, then stop anyway: a machine that cannot answer
+# must not run (and cost) for nothing. The next question starts it again.
 if ! idle=$(curl -fsS -m 5 "$RUNNER_URL/idle"); then
-  logger -t claude-runner-idle "runner did not answer /idle; not stopping"
+  if (( uptime_secs >= MIN_UPTIME_SECS + IDLE_STOP_SECS )); then
+    logger -t claude-runner-idle "runner has not answered /idle for a while; stopping the machine"
+    systemctl poweroff
+  else
+    logger -t claude-runner-idle "runner did not answer /idle; not stopping yet"
+  fi
   exit 0
 fi
 
