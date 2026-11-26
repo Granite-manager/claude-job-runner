@@ -15,13 +15,18 @@
 //! * [`granite::GraniteApi`] gets each job a token that acts as the person
 //!   who asked; the job reads the Granite Manager API with it through the
 //!   API's MCP server, and has no other data source.
+//! * [`progress`] turns the session's tool calls into steps the person
+//!   waiting can follow, and [`pages`] collects the HTML pages it made.
 //! * [`http`] exposes a tiny Hyper API for enqueuing and inspecting jobs.
 
+pub mod activity;
 pub mod claude;
 pub mod config;
 pub mod granite;
 pub mod http;
 pub mod job;
+pub mod pages;
+pub mod progress;
 pub mod store;
 pub mod worker;
 pub mod workspace;

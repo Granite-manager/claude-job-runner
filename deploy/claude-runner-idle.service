@@ -1,0 +1,8 @@
+[Unit]
+Description=Stop the machine when the claude-job-runner is idle
+After=claude-job-runner.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/claude-job-runner/idle.env
+ExecStart=/home/runner/claude-job-runner/deploy/idle-stop.sh

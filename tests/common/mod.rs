@@ -54,6 +54,8 @@ escape() { local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; printf '%s' "$s";
 success() {
   printf '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"result":"%s","session_id":"fake-session","total_cost_usd":0.01,"permission_denials":[{"tool_name":"Bash"}]}' "$(escape "$1")"
 }
+# A follow-up's prompt starts with the conversation; the command is its last line.
+prompt="${prompt##*$'\n'}"
 case "$prompt" in
   ok:*)    success "${prompt#ok:}" ;;
   error)   printf '{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":9,"result":"partial answer"}' ;;

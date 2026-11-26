@@ -170,6 +170,60 @@ Two Ubuntu 24.04 specifics:
 `make deploy`, `make logs`, ...). Server targets run on the host, or forward
 themselves over SSH when invoked from a laptop.
 
+## Stopping the machine between questions
+
+The runner gets a few questions a day, so its EC2 instance sleeps between
+them and is started on demand:
+
+* The Granite API starts the instance (`ec2:StartInstances`) when someone
+  starts typing on the Agent page (`POST /v1/ai/agent/wake`), when a
+  question is asked, and again while a question waits to be picked up (so
+  a machine that was stopping just then comes back). It needs
+  `AGENT_RUNNER_INSTANCE_ID` (and `AGENT_RUNNER_REGION` if the instance is
+  in another region) on the API, and that permission on its role.
+* `deploy/idle-stop.sh`, run every minute by `claude-runner-idle.timer` as
+  root, powers the machine off once `GET /idle` reports no running job for
+  `IDLE_STOP_SECS` (default 600) and the machine has been up for at least
+  `MIN_UPTIME_SECS` (default 600). The instance must have
+  `InstanceInitiatedShutdownBehavior=stop` so a power-off stops rather
+  than terminates it. Settings go in `/etc/claude-job-runner/idle.env`.
+
+```sh
+sudo cp deploy/claude-runner-idle.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now claude-runner-idle.timer
+aws ec2 modify-instance-attribute --instance-id i-... \
+  --instance-initiated-shutdown-behavior '{"Value":"stop"}'
+```
+
+A stopped instance costs only its disk. A cold start takes roughly
+30 seconds; the Agent page hides most of it by waking the machine while the
+question is being typed. For a fast boot, keep the image lean (no snapd,
+cloud-init only on the first boot) and enable `claude-job-runner.service`
+so it starts with the machine.
+
+## Progress, pages and follow-ups
+
+Jobs run with `--output-format stream-json`. Every tool call becomes a
+short step ("Looking up deals", "Designing sales.html") in the question's
+`payload.progress`, written at most every 1.5 s while the job runs, so the
+Agent page can show what the agent is doing.
+
+The system prompt asks the agent to build a page for anything visual: a
+complete HTML document in `pages/<name>.html` in its workspace. After a
+successful run the runner reads them (at most 6, 1.5 MB each, 3 MB in all;
+see `src/pages.rs`) into the answer's `payload.pages`
+(`[{name, title, html}]`). The Agent page shows each one in a sandboxed
+frame with no network, adding the Granite Manager header and the `gm-*`
+styles and `GM.*` chart helpers the prompt describes (granite-front
+`app/utils/agentKit.ts`): keep the two in step.
+
+Jobs never get artifact tools (`--disallowedTools`, see
+`DISALLOWED_TOOLS`), nor web search or fetch.
+
+A question asked in a chat that already has agentic questions is a
+follow-up: its prompt carries up to six earlier questions with their
+answers (and the titles of their pages), oldest first.
+
 ## Enqueuing work
 
 Normally the chat application inserts the user message itself:
@@ -187,6 +241,7 @@ The HTTP API itself:
 | Method | Path         | Body                                 | Response                         |
 |--------|--------------|--------------------------------------|----------------------------------|
 | GET    | `/health`    |                                      | `{"status":"ok"}`                |
+| GET    | `/idle`      |                                      | `{"running":0,"idle_secs":42}`   |
 | POST   | `/jobs`      | `{"chat_id": 12, "content": "..."}`  | `201` with the created job       |
 | GET    | `/jobs/{id}` |                                      | the job or `404`                 |
 
@@ -304,10 +359,14 @@ src/
   claude.rs     ClaudeConfig, CliRunner (spawn + parse), ClaudeRunner trait
   worker.rs     polling loop with a semaphore bounding concurrent jobs
   granite.rs    GraniteApi: per-question agent tokens from the Granite API
+  progress.rs   stream-json events → steps the Agent page shows
+  pages.rs      the HTML pages a job made, kept with its answer
+  activity.rs   running jobs and idle time, for GET /idle
   http.rs       Hyper API
   main.rs       wiring and graceful shutdown
 crates/
   jobctl/       library (db, chats, api) + the `jobctl` CLI
+deploy/         idle timer that stops the machine between questions
 schema/         reference copy of the chat tables (source of truth: granite-webhooks)
 tests/          integration tests
 ```
