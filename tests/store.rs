@@ -334,3 +334,56 @@ async fn requeue_pending_resets_only_pending_rows(pool: MySqlPool) {
     // The orphan is claimable again, and comes first because it is oldest.
     assert_eq!(store.claim_next().await.unwrap().unwrap().id, orphaned);
 }
+
+#[sqlx::test(migrations = false)]
+async fn progress_pages_and_history_live_in_the_payload(pool: MySqlPool) {
+    use claude_job_runner::pages::Page;
+    let (store, chat) = common::store(pool.clone()).await;
+    let first = store.insert(chat, "Sales this month?").await.unwrap();
+    let job = store.claim_next().await.unwrap().unwrap();
+    assert_eq!(job.id, first);
+    store
+        .set_progress(first, r#"[{"at":1,"text":"Looking up deals"}]"#)
+        .await
+        .unwrap();
+    let page = Page {
+        name: "sales.html".into(),
+        title: "Sales".into(),
+        html: "<title>Sales</title><p>\"quoted\"</p>".into(),
+    };
+    store
+        .finish_with_pages(
+            first,
+            &JobOutcome::Success {
+                result: "$10,000.".into(),
+            },
+            std::slice::from_ref(&page),
+        )
+        .await
+        .unwrap();
+    // Progress written after the job ended is ignored.
+    store.set_progress(first, "[]").await.unwrap();
+
+    let row = sqlx::query(
+        "SELECT CAST(JSON_EXTRACT(q.payload, '$.progress[0].text') AS CHAR) AS step, \
+                CAST(JSON_EXTRACT(a.payload, '$.pages[0].html') AS CHAR) AS html \
+         FROM chat_messages q JOIN chat_messages a \
+           ON a.id = CAST(JSON_EXTRACT(q.payload, '$.reply_id') AS UNSIGNED) \
+         WHERE q.id = ?",
+    )
+    .bind(first.get())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("step"), "\"Looking up deals\"");
+    let html: String = row.get("html");
+    assert_eq!(serde_json::from_str::<String>(&html).unwrap(), page.html);
+
+    let second = store.insert(chat, "And last month?").await.unwrap();
+    let history = store.history(second, 6).await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].question, "Sales this month?");
+    assert_eq!(history[0].answer.as_deref(), Some("$10,000."));
+    assert_eq!(history[0].pages, ["Sales"]);
+    assert_eq!(store.history(first, 6).await.unwrap().len(), 0);
+}

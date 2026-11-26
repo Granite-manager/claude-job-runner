@@ -239,3 +239,95 @@ mod tests {
         assert_eq!(serde_json::to_string(&ChatId::new(3)).unwrap(), "3");
     }
 }
+
+/// An earlier question of the same conversation, for a follow-up's context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Turn {
+    /// What was asked.
+    pub question: String,
+    /// The answer, if there was one.
+    pub answer: Option<String>,
+    /// The question failed.
+    pub failed: bool,
+    /// The titles of the pages made for it.
+    pub pages: Vec<String>,
+}
+
+/// Longest earlier answer quoted in a follow-up's prompt, in characters.
+const MAX_QUOTED_ANSWER: usize = 3000;
+
+fn quoted(text: &str, max: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let mut cut: String = text.chars().take(max).collect();
+    cut.push_str(" […]");
+    cut
+}
+
+/// The prompt for `question` after the conversation `history`: the
+/// question alone when there is no history.
+#[must_use]
+pub fn prompt_with_history(history: &[Turn], question: &str) -> String {
+    if history.is_empty() {
+        return question.to_owned();
+    }
+    let mut prompt = String::from(
+        "This is a follow-up in a conversation with the same person. Earlier in it:\n\n",
+    );
+    for turn in history {
+        prompt.push_str("<earlier_question>\n");
+        prompt.push_str(turn.question.trim());
+        prompt.push_str("\n</earlier_question>\n<earlier_answer>\n");
+        match &turn.answer {
+            Some(answer) => prompt.push_str(&quoted(answer, MAX_QUOTED_ANSWER)),
+            None if turn.failed => prompt.push_str("(no answer: it failed)"),
+            None => prompt.push_str("(no answer)"),
+        }
+        if !turn.pages.is_empty() {
+            prompt.push_str("\n(Pages made for it: ");
+            prompt.push_str(&turn.pages.join(", "));
+            prompt.push_str(". Build them again if this question needs them.)");
+        }
+        prompt.push_str("\n</earlier_answer>\n\n");
+    }
+    prompt.push_str("Answer this new message (\"it\", \"that\", \"them\" refer to the conversation above):\n\n");
+    prompt.push_str(question);
+    prompt
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    #[test]
+    fn a_first_question_is_sent_as_is() {
+        assert_eq!(prompt_with_history(&[], "ok:hi"), "ok:hi");
+    }
+
+    #[test]
+    fn a_follow_up_carries_the_conversation() {
+        let history = [
+            Turn {
+                question: "Sales this month?".into(),
+                answer: Some("$10,000.".into()),
+                failed: false,
+                pages: vec!["Sales by week".into()],
+            },
+            Turn {
+                question: "Broken".into(),
+                answer: None,
+                failed: true,
+                pages: vec![],
+            },
+        ];
+        let prompt = prompt_with_history(&history, "And last month?");
+        assert!(prompt.contains("<earlier_question>\nSales this month?"));
+        assert!(prompt.contains("$10,000."));
+        assert!(prompt.contains("Pages made for it: Sales by week"));
+        assert!(prompt.contains("(no answer: it failed)"));
+        assert!(prompt.ends_with("And last month?"));
+        assert!(quoted(&"x".repeat(5000), 10).ends_with("[…]"));
+    }
+}

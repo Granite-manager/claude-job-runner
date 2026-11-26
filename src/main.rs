@@ -32,6 +32,7 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    claude_job_runner::activity::touch();
     let config = Config::from_env()?;
     let api = GraniteApi::new(&config.api_url, config.agent_runner_key.clone())?;
     info!(mcp = %api.mcp_url(), "jobs get the Granite API as the person who asked");

@@ -9,7 +9,9 @@
 //! * user row, on success: `payload.reply_id` = id of the `ai` row;
 //! * user row, on failure: `payload.error` (and `payload.result` when Claude
 //!   produced a partial answer);
-//! * ai row: `payload.in_reply_to` = id of the user row.
+//! * user row, while running: `payload.progress` = the steps so far;
+//! * ai row: `payload.in_reply_to` = id of the user row, and
+//!   `payload.pages` = the HTML pages the job made (`[{name, title, html}]`).
 //!
 //! The chat application may also set `payload.requester_is_admin` on the
 //! user row; see [`Requester::is_admin`].
@@ -20,7 +22,8 @@
 use sqlx::mysql::MySqlPoolOptions;
 use sqlx::{FromRow, MySqlPool, Row};
 
-use crate::job::{ChatId, Job, JobOutcome, JobStatus, MessageId, Requester, UnknownStatus};
+use crate::job::{ChatId, Job, JobOutcome, JobStatus, MessageId, Requester, Turn, UnknownStatus};
+use crate::pages::Page;
 
 /// How many times [`JobStore::claim_next`] retries when another worker
 /// wins the race for the same row.
@@ -227,24 +230,43 @@ impl JobStore {
     /// the row is not `pending`, which guards against two workers finishing
     /// the same job.
     pub async fn finish(&self, id: MessageId, outcome: &JobOutcome) -> Result<(), StoreError> {
+        self.finish_with_pages(id, outcome, &[]).await
+    }
+
+    /// [`Self::finish`], storing the HTML pages the job made with its answer
+    /// (`payload.pages` of the `ai` row). A failed job keeps no pages.
+    pub async fn finish_with_pages(
+        &self,
+        id: MessageId,
+        outcome: &JobOutcome,
+        pages: &[Page],
+    ) -> Result<(), StoreError> {
         match outcome {
-            JobOutcome::Success { result } => self.finish_done(id, result).await,
+            JobOutcome::Success { result } => self.finish_done(id, result, pages).await,
             JobOutcome::Failed { error, result } => {
                 self.finish_failed(id, error, result.as_deref()).await
             }
         }
     }
 
-    async fn finish_done(&self, id: MessageId, result: &str) -> Result<(), StoreError> {
+    async fn finish_done(
+        &self,
+        id: MessageId,
+        result: &str,
+        pages: &[Page],
+    ) -> Result<(), StoreError> {
+        let pages = serde_json::to_string(pages).unwrap_or_else(|_| "[]".to_owned());
         let mut tx = self.pool.begin().await?;
         // Copying `chat_id` from the pending row itself makes the insert a
         // no-op when the job is not pending any more.
         let inserted = sqlx::query(
             "INSERT INTO chat_messages (chat_id, sender, content, is_agentic, payload) \
-             SELECT chat_id, 'ai', ?, 1, JSON_OBJECT('in_reply_to', id) \
+             SELECT chat_id, 'ai', ?, 1, \
+                    JSON_OBJECT('in_reply_to', id, 'pages', CAST(? AS JSON)) \
              FROM chat_messages WHERE id = ? AND status = ?",
         )
         .bind(result)
+        .bind(pages)
         .bind(id.get())
         .bind(JobStatus::Pending.to_db())
         .execute(&mut *tx)
@@ -297,6 +319,60 @@ impl JobStore {
         } else {
             Err(StoreError::NotPending(id))
         }
+    }
+
+    /// Records what a running job has done so far (`payload.progress`, a
+    /// JSON array of steps). Only while the job is still `pending`.
+    pub async fn set_progress(&self, id: MessageId, steps_json: &str) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE chat_messages \
+             SET payload = JSON_SET(COALESCE(payload, JSON_OBJECT()), '$.progress', CAST(? AS JSON)) \
+             WHERE id = ? AND status = ?",
+        )
+        .bind(steps_json)
+        .bind(id.get())
+        .bind(JobStatus::Pending.to_db())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The agentic conversation before message `id` in its chat, oldest
+    /// first: at most `limit` questions, each with its answer if it has one.
+    pub async fn history(&self, id: MessageId, limit: u32) -> Result<Vec<Turn>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT q.content AS question, CAST(q.status AS CHAR) AS status, a.content AS answer, \
+                    CAST(JSON_EXTRACT(a.payload, '$.pages[*].title') AS CHAR) AS page_titles \
+             FROM chat_messages q \
+             JOIN chat_messages me ON me.id = ? \
+             LEFT JOIN chat_messages a \
+               ON a.id = CAST(JSON_EXTRACT(q.payload, '$.reply_id') AS UNSIGNED) \
+              AND a.sender = 'ai' AND a.chat_id = q.chat_id \
+             WHERE q.chat_id = me.chat_id AND q.id < me.id \
+               AND q.sender = 'user' AND q.is_agentic = 1 \
+             ORDER BY q.id DESC LIMIT ?",
+        )
+        .bind(id.get())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut turns = rows
+            .into_iter()
+            .map(|row| {
+                let titles: Option<String> = row.try_get("page_titles")?;
+                let status: Option<String> = row.try_get("status")?;
+                Ok(Turn {
+                    question: row.try_get("question")?,
+                    answer: row.try_get("answer")?,
+                    failed: status.as_deref() == Some("failed"),
+                    pages: titles
+                        .and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok())
+                        .unwrap_or_default(),
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()?;
+        turns.reverse();
+        Ok(turns)
     }
 
     /// Puts every `pending` job back to `NULL`.

@@ -35,6 +35,7 @@ async fn successful_run_is_parsed_and_invoked_correctly() {
                 company_id: 7,
                 is_admin: false,
             }),
+            steps: None,
         })
         .await
         .unwrap();
@@ -60,7 +61,7 @@ async fn successful_run_is_parsed_and_invoked_correctly() {
     let args = std::fs::read_to_string(ws.join("args.txt")).unwrap();
     let args: Vec<&str> = args.lines().collect();
     assert!(args.contains(&"--print"));
-    assert!(args.windows(2).any(|w| w == ["--output-format", "json"]));
+    assert!(args.windows(2).any(|w| w == ["--output-format", "stream-json"]));
     assert!(args.windows(2).any(|w| w == ["--model", "opus"]));
     assert!(args.windows(2).any(|w| w == ["--max-turns", "3"]));
     assert!(args.windows(2).any(|w| w == ["--effort", "low"]));
@@ -72,11 +73,11 @@ async fn successful_run_is_parsed_and_invoked_correctly() {
     let settings: serde_json::Value = serde_json::from_str(args[settings_index + 1]).unwrap();
     assert_eq!(settings["sandbox"]["enabled"], true);
     // The requester reaches the model as system prompt, not as the prompt.
-    let system_index = args
-        .iter()
-        .position(|a| *a == "--append-system-prompt")
-        .unwrap();
-    assert!(args[system_index + 1].contains("user 42 of company 7"));
+    // (args.txt has one argument per line; the system prompt spans several.)
+    assert!(args.contains(&"--append-system-prompt"));
+    let all = std::fs::read_to_string(ws.join("args.txt")).unwrap();
+    assert!(all.contains("user 42 of company 7"));
+    assert!(all.contains("pages/<short-name>.html"));
 }
 
 #[tokio::test]
@@ -90,6 +91,7 @@ async fn error_report_becomes_a_failed_outcome_with_partial_result() {
             prompt: "error",
             workspace: tmp.path(),
             requester: None,
+            steps: None,
         })
         .await
         .unwrap();
@@ -115,6 +117,7 @@ async fn non_zero_exit_surfaces_stderr() {
             prompt: "crash",
             workspace: tmp.path(),
             requester: None,
+            steps: None,
         })
         .await
         .unwrap_err();
@@ -139,6 +142,7 @@ async fn unparseable_output_is_reported() {
             prompt: "garbage",
             workspace: tmp.path(),
             requester: None,
+            steps: None,
         })
         .await
         .unwrap_err();
@@ -165,6 +169,7 @@ async fn timeout_kills_the_process() {
             prompt: "sleep:30",
             workspace: tmp.path(),
             requester: None,
+            steps: None,
         })
         .await
         .unwrap_err();
@@ -187,6 +192,7 @@ async fn missing_binary_is_a_spawn_error() {
             prompt: "ok:x",
             workspace: tmp.path(),
             requester: None,
+            steps: None,
         })
         .await
         .unwrap_err();

@@ -5,6 +5,7 @@
 //! | Method | Path         | Body                              | Response                 |
 //! |--------|--------------|-----------------------------------|--------------------------|
 //! | GET    | `/health`    |                                   | `{"status":"ok"}`        |
+//! | GET    | `/idle`      |                                   | `{"running","idle_secs"}` |
 //! | POST   | `/jobs`      | `{"chat_id": 1, "content":"..."}` | `201` with the new job   |
 //! | GET    | `/jobs/{id}` |                                   | the job, or `404`        |
 //!
@@ -125,6 +126,7 @@ async fn route(
             StatusCode::OK,
             &serde_json::json!({ "status": "ok" }),
         )),
+        (&Method::GET, "/idle") => Ok(json_response(StatusCode::OK, &crate::activity::idle())),
         (&Method::POST, "/jobs") => {
             let create: CreateJob = read_json(req).await?;
             if create.content.trim().is_empty() {

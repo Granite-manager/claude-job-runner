@@ -1,7 +1,9 @@
 //! Running one job inside a headless, sandboxed Claude Code session.
 //!
 //! [`CliRunner`] shells out to the `claude` binary with `-p` (print mode)
-//! and `--output-format json`, feeding the prompt over stdin. The process
+//! and `--output-format stream-json`, feeding the prompt over stdin and
+//! reading one event per line: tool calls become the job's progress
+//! ([`crate::progress`]) and the final `result` event is the report. The process
 //! runs with the job's workspace as `cwd` and a CLI-level `--settings`
 //! payload that turns on Claude Code's OS sandbox, so shell commands can
 //! read the whole machine but only write inside the workspace. The built-in
@@ -22,7 +24,8 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::json;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::{debug, warn};
@@ -51,6 +54,58 @@ const RUNNER_ONLY_ENV: [&str; 9] = [
     "DB_USER",
     "DB_PASSWORD",
 ];
+
+/// Tools a job never gets: it answers in text and HTML pages in its
+/// workspace, never by publishing artifacts or pages elsewhere, and print
+/// mode cannot ask the person anything mid-run.
+pub const DISALLOWED_TOOLS: [&str; 14] = [
+    "Artifact",
+    "ArtifactData",
+    "ArtifactComments",
+    "ArtifactCheck",
+    "AskUserQuestion",
+    "DesignSync",
+    "SendToProject",
+    "SendToProjectContext",
+    "PushNotification",
+    "RemoteTrigger",
+    "CronCreate",
+    "ScheduleWakeup",
+    "WebFetch",
+    "WebSearch",
+];
+
+/// How a job answers: a short text answer, and HTML pages for anything
+/// visual. The Agent page (granite-front `app/utils/agentKit.ts`) wraps each
+/// page in Granite Manager's frame with the `gm-*` styles and `GM` helpers
+/// described here.
+fn answer_system_prompt() -> &'static str {
+    r#"## How you answer
+You are the Granite Manager Agent. The person reads your answer on the Agent page of Granite Manager.
+
+- Your final message is the answer: plain Markdown (headings, short paragraphs, bullet lists, **bold**, tables). Lead with the answer itself, then the key figures. Keep it tight; do not describe your process or the tools you used.
+- If the question is ambiguous and the answer would change a lot, ask ONE short follow-up question as your whole answer instead of guessing. You cannot ask anything mid-run.
+- Never publish or create artifacts, links, documents or files anywhere else. You have no artifact tools; do not try to use any.
+
+## Pages (reports, charts, tables)
+When the answer has numbers to compare, a trend, a breakdown, a list longer than about 8 rows, or the person asks for a report, chart, dashboard or table, ALSO build a page: write a complete HTML document to `pages/<short-name>.html` in your working directory (create the folder). Up to 3 pages, each under 1 MB. In your text answer, mention the page in one line ("The full breakdown is in the Sales by month page."); never paste its HTML.
+
+The page is shown inside Granite Manager in a sandboxed frame with NO network: never load scripts, styles, fonts or images from any URL, and never fetch(). Put the data in the page itself (for example `<script>const deals = [...]</script>`). Inline `<style>` and `<script>` are allowed. Give it a `<title>`; the frame adds the Granite Manager header (logo, your title, the date), the fonts, and light and dark themes, so do not add your own header, logo, page background or font imports.
+
+Make pages beautiful and useful: a row of KPI cards at the top, then charts, then the detail table. Use these building blocks, which the frame provides:
+- Layout: `<section class="gm-section"><h2>Title</h2>...</section>`, `<div class="gm-grid">` (responsive columns), `<div class="gm-card">`.
+- KPI: `<div class="gm-kpi"><div class="gm-kpi-label">Won this month</div><div class="gm-kpi-value">$48,200</div><div class="gm-kpi-delta up">+12% vs last month</div></div>` (`up`, `down` or `flat`).
+- Tables: any `<table>` is styled; add `class="gm-sortable"` for click-to-sort headers and `class="num"` on numeric cells. Badges: `<span class="gm-badge good">` (`good`, `warn`, `bad` or `info`).
+- Text: `<p class="gm-muted">`, `<div class="gm-note">` for a callout.
+- Charts (SVG, branded, with tooltips), each drawn into an empty element, for example `<div id="m"></div><script>GM.bar('#m', {...})</script>`:
+  - `GM.bar(el, { labels: [...], series: [{ name, values: [...] }], stacked?, horizontal?, format? })`
+  - `GM.line(el, { labels, series: [{ name, values }], area?, format? })`
+  - `GM.donut(el, { labels, values, format? })`
+  - `GM.spark(el, values)` (a tiny inline trend)
+  - `format` is `'money'`, `'number'` or `'percent'`. Formatters: `GM.money(n)`, `GM.number(n)`, `GM.percent(n)` (0.12 is 12%).
+You may add your own small interactive touches in plain JavaScript (filters, toggles), but keep the GM building blocks so pages look like Granite Manager.
+Quote every figure exactly as the API returned it; never invent data for a chart."#
+}
 
 /// The system prompt of a job that has the API.
 fn api_system_prompt() -> &'static str {
@@ -266,7 +321,9 @@ impl ClaudeConfig {
         let mut cmd = std::process::Command::new(&self.binary);
         cmd.current_dir(workspace)
             .arg("--print")
-            .args(["--output-format", "json"])
+            .args(["--output-format", "stream-json"])
+            // stream-json in print mode requires --verbose.
+            .arg("--verbose")
             .args(["--permission-mode", self.permission_mode.as_cli_value()])
             .args(["--effort", self.effort.as_cli_value()])
             .args(["--max-turns", &self.max_turns.to_string()])
@@ -280,6 +337,8 @@ impl ClaudeConfig {
         if !self.persist_sessions {
             cmd.arg("--no-session-persistence");
         }
+        cmd.arg("--disallowedTools").arg(DISALLOWED_TOOLS.join(","));
+        system_prompt.push(answer_system_prompt().to_owned());
         for name in RUNNER_ONLY_ENV.iter().chain(&[TOKEN_ENV]) {
             cmd.env_remove(name);
         }
@@ -335,6 +394,8 @@ pub struct RunRequest<'a> {
     pub workspace: &'a Path,
     /// Who asked, if known; tells the model who "I" and "my" are.
     pub requester: Option<Requester>,
+    /// Where to send each step of the run as it happens, if anywhere.
+    pub steps: Option<&'a UnboundedSender<String>>,
 }
 
 /// What Claude Code reported for a finished run.
@@ -445,6 +506,23 @@ pub enum RunError {
     },
 }
 
+/// A task that is aborted when dropped: a run whose future is dropped (the
+/// runner shutting down) must not leave its pipe readers behind.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> AbortOnDrop<T> {
+    /// The task's result, waiting at most a few seconds for it.
+    async fn finish(mut self) -> Option<T> {
+        timeout(Duration::from_secs(5), &mut self.0).await.ok()?.ok()
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Something that can execute a prompt and report back.
 ///
 /// Abstracted so the worker can be tested without a real `claude` binary.
@@ -484,8 +562,19 @@ impl CliRunner {
         &self.config
     }
 
+    /// The report in the output: the last `result` event of a stream, else
+    /// the whole output as one `--output-format json` document.
     fn parse_report(stdout: &[u8]) -> Result<RunReport, serde_json::Error> {
-        serde_json::from_slice::<RawReport>(stdout).map(RunReport::from)
+        let text = String::from_utf8_lossy(stdout);
+        let result_event = text.lines().rev().find_map(|line| {
+            let value: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+            (value.get("type").and_then(serde_json::Value::as_str) == Some("result"))
+                .then_some(value)
+        });
+        match result_event {
+            Some(event) => serde_json::from_value::<RawReport>(event).map(RunReport::from),
+            None => serde_json::from_slice::<RawReport>(stdout).map(RunReport::from),
+        }
     }
 }
 
@@ -534,23 +623,65 @@ impl ClaudeRunner for CliRunner {
             drop(stdin);
         });
 
-        let waited = timeout(self.config.timeout, child.wait_with_output()).await;
-        feeder.abort();
-        let output = match waited {
-            Ok(output) => output?,
-            // Dropping the timed-out future drops the child, which kills it.
-            Err(_elapsed) => return Err(RunError::Timeout(self.config.timeout)),
-        };
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| RunError::Io(std::io::Error::other("child stdout was not captured")))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| RunError::Io(std::io::Error::other("child stderr was not captured")))?;
+        let steps = request.steps.cloned();
+        // Read events as they come: tool calls are the job's progress, and
+        // only the lines that can be the report are kept.
+        let reader = AbortOnDrop(tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            let mut kept = Vec::new();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Some(steps) = &steps {
+                    for step in crate::progress::steps_of(&line) {
+                        let _ = steps.send(step);
+                    }
+                }
+                let trimmed = line.trim_start();
+                // The report, or (from an older CLI) a non-stream document.
+                if trimmed.starts_with(r#"{"type":"result""#) || !trimmed.starts_with('{') {
+                    kept.extend_from_slice(line.as_bytes());
+                    kept.push(b'\n');
+                }
+            }
+            kept
+        }));
+        let stderr_reader = AbortOnDrop(tokio::spawn(async move {
+            let mut text = String::new();
+            let _ = stderr.read_to_string(&mut text).await;
+            text
+        }));
 
-        match Self::parse_report(&output.stdout) {
+        let waited = timeout(self.config.timeout, child.wait()).await;
+        feeder.abort();
+        let status = match waited {
+            Ok(status) => status?,
+            Err(_elapsed) => {
+                // Dropping the child kills it (kill_on_drop).
+                drop(child);
+                return Err(RunError::Timeout(self.config.timeout));
+            }
+        };
+        // A grandchild that outlives claude may hold the pipes open; do not
+        // wait on it for long.
+        let stdout = reader.finish().await.unwrap_or_default();
+        let stderr = stderr_reader.finish().await.unwrap_or_default();
+
+        match Self::parse_report(&stdout) {
             Ok(report) => Ok(report),
-            Err(source) if output.status.success() => Err(RunError::InvalidOutput {
+            Err(source) if status.success() => Err(RunError::InvalidOutput {
                 source,
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stdout: String::from_utf8_lossy(&stdout).into_owned(),
             }),
             Err(_) => Err(RunError::Exited {
-                status: output.status,
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                status,
+                stderr: stderr.trim().to_owned(),
             }),
         }
     }
@@ -619,7 +750,14 @@ mod tests {
         assert_eq!(cmd.get_program(), "/opt/bin/claude");
         assert_eq!(cmd.get_current_dir(), Some(ws));
         assert!(args.contains(&"--print".to_owned()));
-        assert!(args.windows(2).any(|w| w == ["--output-format", "json"]));
+        assert!(args.windows(2).any(|w| w == ["--output-format", "stream-json"]));
+        assert!(args.contains(&"--verbose".to_owned()));
+        let disallowed = args
+            .windows(2)
+            .find(|w| w[0] == "--disallowedTools")
+            .map(|w| w[1].clone())
+            .unwrap();
+        assert!(disallowed.split(',').any(|tool| tool == "Artifact"));
         assert!(
             args.windows(2)
                 .any(|w| w == ["--permission-mode", "bypassPermissions"])
@@ -659,7 +797,11 @@ mod tests {
                 .any(|w| w == ["--mcp-config", r#"{"mcpServers":{}}"#])
         );
         assert!(args.contains(&"--strict-mcp-config".to_owned()));
-        assert!(!args.contains(&"--append-system-prompt".to_owned()));
+        // Every job learns how to answer, pages included.
+        let cmd = ClaudeConfig::default().command(Path::new("/tmp"), None, None);
+        let prompt = system_prompt_of(&cmd);
+        assert!(prompt.contains("pages/<short-name>.html"));
+        assert!(prompt.contains("GM.bar"));
     }
 
     #[test]
@@ -768,6 +910,21 @@ mod tests {
                 permission_denials: 1,
             }
         );
+    }
+
+    #[test]
+    fn report_is_the_last_result_event_of_a_stream() {
+        let stdout = concat!(
+            r#"{"type":"system","subtype":"init"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[]}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"streamed"}"#,
+            "\n"
+        );
+        let report = CliRunner::parse_report(stdout.as_bytes()).unwrap();
+        assert_eq!(report.result.as_deref(), Some("streamed"));
+        assert!(CliRunner::parse_report(b"not json\n").is_err());
     }
 
     #[test]

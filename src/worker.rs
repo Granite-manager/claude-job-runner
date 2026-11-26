@@ -20,7 +20,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::claude::{ClaudeRunner, RunRequest};
-use crate::job::{Job, JobOutcome};
+use crate::job::{Job, JobOutcome, MessageId, prompt_with_history};
+use crate::pages::{self, Page};
+use crate::progress::Progress;
+use tokio::sync::mpsc::{self, UnboundedReceiver};
+use tokio::time::Instant;
 use crate::store::JobStore;
 use crate::workspace::{Workspace, WorkspaceRoot};
 
@@ -131,28 +135,54 @@ impl<R: ClaudeRunner + 'static> Worker<R> {
     /// Executes one already-claimed job and stores its outcome.
     pub async fn process(&self, job: Job, shutdown: &CancellationToken) -> JobOutcome {
         info!(job = %job.id, "starting job");
-        let outcome = self.execute(&job, shutdown).await;
+        let _active = crate::activity::job_started();
+        let (outcome, pages) = self.execute(&job, shutdown).await;
         match &outcome {
             JobOutcome::Success { .. } => info!(job = %job.id, "job succeeded"),
             JobOutcome::Failed { error, .. } => warn!(job = %job.id, error, "job failed"),
         }
-        if let Err(err) = self.inner.store.finish(job.id, &outcome).await {
+        if let Err(err) = self
+            .inner
+            .store
+            .finish_with_pages(job.id, &outcome, &pages)
+            .await
+        {
             error!(job = %job.id, error = %chain(&err), "could not record job outcome");
         }
         outcome
     }
 
-    async fn execute(&self, job: &Job, shutdown: &CancellationToken) -> JobOutcome {
+    async fn execute(&self, job: &Job, shutdown: &CancellationToken) -> (JobOutcome, Vec<Page>) {
         let workspace = match Workspace::create(&self.inner.root, job.id).await {
             Ok(workspace) => workspace,
-            Err(err) => return JobOutcome::failed(chain(&err)),
+            Err(err) => return (JobOutcome::failed(chain(&err)), Vec::new()),
         };
+
+        // A follow-up carries the conversation so far.
+        let history = match self.inner.store.history(job.id, HISTORY_TURNS).await {
+            Ok(history) => history,
+            Err(err) => {
+                warn!(job = %job.id, error = %chain(&err), "could not read the conversation");
+                Vec::new()
+            }
+        };
+        let prompt = prompt_with_history(&history, &job.content);
+
+        // Steps go to the question's payload as they happen, at most every
+        // PROGRESS_EVERY, so the person waiting sees what the agent does.
+        let (steps_tx, steps_rx) = mpsc::unbounded_channel();
+        let recorder = tokio::spawn(record_progress(
+            self.inner.store.clone(),
+            job.id,
+            steps_rx,
+        ));
 
         let request = RunRequest {
             question: job.id,
-            prompt: &job.content,
+            prompt: &prompt,
             workspace: workspace.path(),
             requester: job.requester,
+            steps: Some(&steps_tx),
         };
         let outcome = tokio::select! {
             run = self.inner.runner.run(request) => match run {
@@ -171,11 +201,75 @@ impl<R: ClaudeRunner + 'static> Worker<R> {
             },
             () = shutdown.cancelled() => JobOutcome::failed("runner shut down before the job finished"),
         };
+        drop(steps_tx);
+        if let Err(err) = recorder.await {
+            warn!(job = %job.id, error = %err, "progress recorder ended abnormally");
+        }
+
+        let pages = if matches!(outcome, JobOutcome::Success { .. }) {
+            pages::collect(workspace.path()).await
+        } else {
+            Vec::new()
+        };
+        if !pages.is_empty() {
+            info!(job = %job.id, pages = pages.len(), "job made pages");
+        }
 
         if let Err(err) = workspace.remove().await {
             warn!(job = %job.id, error = %chain(&err), "could not remove workspace");
         }
-        outcome
+        (outcome, pages)
+    }
+}
+
+/// Earlier questions of the conversation a follow-up's prompt carries.
+const HISTORY_TURNS: u32 = 6;
+
+/// Least time between two progress writes of one job.
+const PROGRESS_EVERY: Duration = Duration::from_millis(1500);
+
+/// Writes a job's steps to its row as they arrive, batched, and once more
+/// when the run ends so the last steps are kept.
+async fn record_progress(store: JobStore, id: MessageId, mut steps: UnboundedReceiver<String>) {
+    let mut progress = Progress::default();
+    let mut dirty = false;
+    let mut last_write: Option<Instant> = None;
+    loop {
+        let wait = last_write.map_or(Duration::ZERO, |at| PROGRESS_EVERY.saturating_sub(at.elapsed()));
+        let next = if dirty {
+            match tokio::time::timeout(wait, steps.recv()).await {
+                Ok(next) => next.map(Some),
+                Err(_elapsed) => Some(None),
+            }
+        } else {
+            steps.recv().await.map(Some)
+        };
+        match next {
+            Some(Some(step)) => {
+                crate::activity::touch();
+                dirty |= progress.push(crate::activity::now(), step);
+                if dirty && last_write.is_none_or(|at| at.elapsed() >= PROGRESS_EVERY) {
+                    write_progress(&store, id, &progress).await;
+                    last_write = Some(Instant::now());
+                    dirty = false;
+                }
+            }
+            Some(None) => {
+                write_progress(&store, id, &progress).await;
+                last_write = Some(Instant::now());
+                dirty = false;
+            }
+            None => break,
+        }
+    }
+    if dirty {
+        write_progress(&store, id, &progress).await;
+    }
+}
+
+async fn write_progress(store: &JobStore, id: MessageId, progress: &Progress) {
+    if let Err(err) = store.set_progress(id, &progress.to_json()).await {
+        warn!(job = %id, error = %chain(&err), "could not record progress");
     }
 }
 
