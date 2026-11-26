@@ -1,20 +1,15 @@
-//! Tools for the chat database and the runner, shared by the `jobctl` CLI
-//! and the `jobctl-mcp` server.
+//! Tools for the chat queue and the runner, behind the `jobctl` CLI.
 //!
 //! * [`db`] resolves credentials and opens a connection.
-//! * [`sql`] runs an arbitrary statement and renders the result as text.
 //! * [`chats`] reads and writes `chats` / `chat_messages` the way the chat
 //!   application does.
 //! * [`api`] talks to a running daemon over its HTTP API.
-//! * [`qbo`] reads a company's QuickBooks Online account for a job.
 //!
 //! Everything here returns data; printing is left to the binaries.
 
 pub mod api;
 pub mod chats;
 pub mod db;
-pub mod qbo;
-pub mod sql;
 
 /// Errors produced by this crate.
 #[derive(Debug, thiserror::Error)]

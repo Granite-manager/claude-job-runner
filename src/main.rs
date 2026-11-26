@@ -2,12 +2,11 @@
 //! shuts everything down cleanly on Ctrl-C / SIGTERM.
 
 use std::process::ExitCode;
-use std::time::Duration;
 
 use claude_job_runner::claude::CliRunner;
 use claude_job_runner::config::Config;
+use claude_job_runner::granite::GraniteApi;
 use claude_job_runner::http;
-use claude_job_runner::qbo::QboBroker;
 use claude_job_runner::store::JobStore;
 use claude_job_runner::worker::Worker;
 use claude_job_runner::workspace::WorkspaceRoot;
@@ -34,11 +33,8 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
-    if let Some(path) = &config.claude.jobctl_mcp {
-        info!(path = %path.display(), "jobs get the jobctl MCP server");
-    } else {
-        info!("jobctl-mcp not found; jobs run without MCP tools");
-    }
+    let api = GraniteApi::new(&config.api_url, config.agent_runner_key.clone())?;
+    info!(mcp = %api.mcp_url(), "jobs get the Granite API as the person who asked");
 
     let store = JobStore::connect(&config.database_url, config.db_max_connections).await?;
     if config.requeue_pending_on_start {
@@ -54,17 +50,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         info!(swept, "removed stale workspaces");
     }
 
-    let mut runner = CliRunner::new(config.claude.clone());
-    match &config.qbo {
-        Some(qbo) if config.claude.jobctl_mcp.is_some() => {
-            // A token handed to a job must outlive the job.
-            let valid_for = config.claude.timeout + Duration::from_mins(5);
-            runner = runner.with_qbo(QboBroker::new(store.pool().clone(), qbo, valid_for)?);
-            info!(environment = ?qbo.environment, "jobs get QuickBooks tools");
-        }
-        Some(_) => info!("AES_KEY is set but jobctl-mcp is missing; jobs get no QuickBooks tools"),
-        None => info!("AES_KEY not set; jobs get no QuickBooks tools"),
-    }
+    let runner = CliRunner::new(config.claude.clone()).with_api(api);
 
     let shutdown = CancellationToken::new();
     let worker = Worker::new(

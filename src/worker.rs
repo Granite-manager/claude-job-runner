@@ -149,6 +149,7 @@ impl<R: ClaudeRunner + 'static> Worker<R> {
         };
 
         let request = RunRequest {
+            question: job.id,
             prompt: &job.content,
             workspace: workspace.path(),
             requester: job.requester,

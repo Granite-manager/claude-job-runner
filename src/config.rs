@@ -8,7 +8,6 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use crate::claude::{ClaudeConfig, Effort, PermissionMode};
-use crate::qbo::{QboConfig, QboEnvironment};
 
 /// Errors from reading the environment.
 #[derive(Debug, thiserror::Error)]
@@ -46,9 +45,11 @@ pub struct Config {
     pub requeue_pending_on_start: bool,
     /// Settings for the `claude` subprocess.
     pub claude: ClaudeConfig,
-    /// QuickBooks access for jobs; `None` (no `AES_KEY`) means jobs get no
-    /// QuickBooks tools.
-    pub qbo: Option<QboConfig>,
+    /// `GRANITE_API_URL`: the Granite Manager API jobs get their data from.
+    pub api_url: String,
+    /// `AGENT_RUNNER_KEY`: what the runner trades for each question's agent
+    /// token. It stays in the runner; jobs never see it.
+    pub agent_runner_key: String,
 }
 
 impl Config {
@@ -69,8 +70,6 @@ impl Config {
             persist_sessions: optional("CLAUDE_PERSIST_SESSIONS")?.unwrap_or(false),
             config_dir: optional("CLAUDE_CONFIG_DIR")?,
             mcp_config: optional("CLAUDE_MCP_CONFIG")?,
-            jobctl_mcp: jobctl_mcp()?,
-            agent_database_url: optional("AGENT_DATABASE_URL")?,
         };
 
         Ok(Self {
@@ -84,34 +83,10 @@ impl Config {
                 .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 8080))),
             requeue_pending_on_start: optional("REQUEUE_PENDING_ON_START")?.unwrap_or(true),
             claude,
-            qbo: qbo()?,
+            api_url: required("GRANITE_API_URL")?,
+            agent_runner_key: required("AGENT_RUNNER_KEY")?,
         })
     }
-}
-
-/// QuickBooks settings, named as in the chat application's environment.
-fn qbo() -> Result<Option<QboConfig>, ConfigError> {
-    let Some(aes_key_hex) = raw("AES_KEY")? else {
-        return Ok(None);
-    };
-    Ok(Some(QboConfig {
-        aes_key_hex,
-        client_id: raw("QBO_CLIENT_ID")?,
-        client_secret: raw("QBO_CLIENT_SECRET")?,
-        environment: QboEnvironment::from_env_value(&raw("QBO_ENV")?.unwrap_or_default()),
-    }))
-}
-
-/// `JOBCTL_MCP_BIN`, or else `jobctl-mcp` next to this executable when it
-/// was built there (`cargo build --workspace` puts them side by side).
-fn jobctl_mcp() -> Result<Option<PathBuf>, ConfigError> {
-    if let Some(path) = optional("JOBCTL_MCP_BIN")? {
-        return Ok(Some(path));
-    }
-    Ok(env::current_exe()
-        .ok()
-        .map(|exe| exe.with_file_name("jobctl-mcp"))
-        .filter(|path| path.is_file()))
 }
 
 fn raw(name: &'static str) -> Result<Option<String>, ConfigError> {
