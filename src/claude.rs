@@ -506,6 +506,22 @@ pub enum RunError {
     },
 }
 
+/// A line of the output worth keeping for the report: the `result` event
+/// (whatever order its keys come in), or anything that is not a JSON event
+/// (an older CLI's single document, or garbage to show in the error).
+fn is_report_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('{') {
+        return !trimmed.is_empty();
+    }
+    if !trimmed.contains("\"result\"") {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(trimmed).map_or(true, |value| {
+        value.get("type").and_then(serde_json::Value::as_str) == Some("result")
+    })
+}
+
 /// A task that is aborted when dropped: a run whose future is dropped (the
 /// runner shutting down) must not leave its pipe readers behind.
 struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
@@ -643,9 +659,9 @@ impl ClaudeRunner for CliRunner {
                         let _ = steps.send(step);
                     }
                 }
-                let trimmed = line.trim_start();
-                // The report, or (from an older CLI) a non-stream document.
-                if trimmed.starts_with(r#"{"type":"result""#) || !trimmed.starts_with('{') {
+                // The report (its keys come in any order: newer CLIs start
+                // it with "duration_api_ms"), or whatever is not an event.
+                if is_report_line(&line) {
                     kept.extend_from_slice(line.as_bytes());
                     kept.push(b'\n');
                 }
@@ -925,6 +941,18 @@ mod tests {
         let report = CliRunner::parse_report(stdout.as_bytes()).unwrap();
         assert_eq!(report.result.as_deref(), Some("streamed"));
         assert!(CliRunner::parse_report(b"not json\n").is_err());
+    }
+
+    #[test]
+    fn the_result_line_is_kept_whatever_its_key_order() {
+        let result = r#"{"duration_api_ms":991,"stop_reason":"end_turn","type":"result","subtype":"success","is_error":false,"result":"hi"}"#;
+        assert!(is_report_line(result));
+        assert!(!is_report_line(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"the result"}]}}"#));
+        assert!(!is_report_line(r#"{"type":"rate_limit_event"}"#));
+        assert!(is_report_line("not json"));
+        assert!(!is_report_line("   "));
+        let report = CliRunner::parse_report(format!("{result}\n").as_bytes()).unwrap();
+        assert_eq!(report.result.as_deref(), Some("hi"));
     }
 
     #[test]
