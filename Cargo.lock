@@ -126,14 +126,12 @@ dependencies = [
 name = "claude-job-runner"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
  "bytes",
  "dotenvy",
  "http-body-util",
  "hyper",
  "hyper-util",
  "reqwest",
- "ring",
  "rustls",
  "serde",
  "serde_json",
@@ -837,16 +835,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "jobctl-mcp"
-version = "0.1.0"
-dependencies = [
- "jobctl",
- "serde_json",
- "sqlx",
- "tokio",
-]
-
-[[package]]
 name = "js-sys"
 version = "0.3.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1117,6 +1105,8 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
+ "serde",
+ "serde_json",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",

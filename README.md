@@ -49,20 +49,32 @@ CLI-level `--settings` payload that:
   cannot prompt, so a prompt is a denial);
 * adds a `Read(//**)` allow rule so the `Read` tool can open any file.
 
-Every job also gets one MCP server, `jobctl-mcp` (see *Tools*), with its
-tools allowed. MCP servers run outside the Bash sandbox, so this is how a
-job reaches the database: the sandbox's network only goes out through an
-HTTP/SOCKS proxy, and a plain `mysql` from Bash cannot even resolve the host.
-When `AGENT_DATABASE_URL` is set, the system prompt also tells the model the
-database is there.
+Every job's only data source is the **Granite Manager API**, through the
+API's own MCP server (`POST $GRANITE_API_URL/v1/mcp`). Jobs get no database
+login of any kind. Before a job starts, the runner trades `AGENT_RUNNER_KEY`
+for a token bound to that one question
+(`POST /v1/ai/agentic-questions/{id}/agent-token`). The token acts as the
+person who asked, in the company they asked in, with their own permissions:
 
-When `AES_KEY` is set, jobs also get read-only **QuickBooks Online** tools
-(see *QuickBooks*).
+* it sees exactly what that user sees in the app, and nothing of any other
+  company;
+* it only reads (plus call transcripts), never as a superuser;
+* it dies when the question is answered or after 30 minutes.
 
-The system prompt also names the person asking: the runner reads the chat's
-`user_id` and `company_id` from `chats` and tells the model that "I", "me"
-and "my" in the prompt mean `users.id = <user_id>`, so "show my deals" is
-scoped to that user without them having to say who they are.
+The MCP server sends every tool call through the API's normal routes with
+that token, so the API's own permission checks are the only gate; nothing
+depends on the model obeying a prompt. The token reaches Claude Code through
+the job's environment (`GRANITE_AGENT_TOKEN`, named as `${GRANITE_AGENT_TOKEN}`
+in the MCP config), never on a command line. A question the API will not
+issue a token for (already answered, older than a week, or its asker lost
+access) is marked `failed` without running Claude.
+
+MCP servers run in Claude Code itself, outside the Bash sandbox, so shell
+commands still cannot reach the network (or the database) at all.
+
+The system prompt names the person asking (the chat's `user_id` and
+`company_id`) so "show my deals" needs no introduction; what they may see is
+decided by the API.
 
 Verified on macOS: a job that reads `/Users/.../README.md`, writes
 `notes.md` in its workspace, and tries to write `~/should_not_exist.txt`
@@ -79,12 +91,11 @@ Things the sandbox does **not** do for you:
 * Reads of credentials such as `~/.ssh` are allowed by default, as in any
   Claude Code session. Add `denyRead` entries via `CLAUDE_CONFIG_DIR`
   settings if that matters to you.
-* The job's environment is the runner's, minus `DATABASE_URL`, `AES_KEY`,
-  `QBO_CLIENT_ID` and `QBO_CLIENT_SECRET`: the writable
-  login stays with the daemon, and jobs get `AGENT_DATABASE_URL` (a
-  read-only login) as their `DATABASE_URL` instead. Since jobs run as the
-  same OS user and can read files, keep the writable URL out of `.env` and
-  pass it to the daemon through a root-only file (see *Deploying*).
+* The job's environment is the runner's, minus `DATABASE_URL`,
+  `AGENT_RUNNER_KEY` and older database and QuickBooks variables. Since jobs
+  run as the same OS user and can read files, keep `DATABASE_URL` and
+  `AGENT_RUNNER_KEY` out of `.env` and pass them to the daemon through a
+  root-only file (see *Deploying*).
 
 Because the workspace is deleted after each job, a job that should change
 one of your projects needs a way to get its work out. The intended pattern
@@ -107,7 +118,8 @@ allow-listed), or to return a diff as its answer.
    `payload`, and inserts `ai` rows. From `chats` it only reads `user_id`
    and `company_id`, to tell each job who is asking.
 
-2. Copy `.env.example` to `.env` and set at least `DATABASE_URL`.
+2. Copy `.env.example` to `.env` and set at least `DATABASE_URL`,
+   `GRANITE_API_URL` and `AGENT_RUNNER_KEY` (the same value as on the API).
 
 3. Make sure `claude` is installed and logged in for the user that will run
    the daemon (`claude --version`).
@@ -190,24 +202,14 @@ curl localhost:8080/jobs/1
 
 ## Tools
 
-The workspace builds three separate binaries into `target/release/`:
+The workspace builds two separate binaries into `target/release/`:
 
 | Binary              | Crate            | What it is                                                   |
 |---------------------|------------------|--------------------------------------------------------------|
-| `claude-job-runner` | `.` (root)       | The daemon. Does not link the other two.                     |
-| `jobctl`            | `crates/jobctl`  | CLI for people; its library holds the actual logic.          |
-| `jobctl-mcp`        | `crates/jobctl-mcp` | The same commands as MCP tools, started once per job.     |
-
-`jobctl-mcp` is a thin wrapper over the `jobctl` library: to give jobs a new
-tool, add the logic to the library (and a `jobctl` subcommand if you want
-it too), then list it in `tools()` and handle it in `Server::call` in
-`crates/jobctl-mcp/src/main.rs`. It has `sql`, plus the `qbo_*` tools when
-the job has QuickBooks access (see *QuickBooks*). It connects
-lazily with the job's `DATABASE_URL` (the read-only `AGENT_DATABASE_URL`),
-so a job that never queries never opens a connection.
+| `claude-job-runner` | `.` (root)       | The daemon. Does not link `jobctl`.                          |
+| `jobctl`            | `crates/jobctl`  | CLI for people: read chats, queue questions, talk to the daemon. |
 
 ```sh
-jobctl sql "SELECT COUNT(*) FROM deals"          # TSV with a header row; SQL may also come on stdin
 jobctl retrieve 12                               # whole chat 12, oldest first (--json for raw rows)
 jobctl enqueue "Summarise README.md."            # new chat for user 1, insert, wait for the answer
 jobctl enqueue --chat 12 "Follow-up"             # existing chat
@@ -217,64 +219,17 @@ jobctl ask --chat 12 "Say hello"                 # through the HTTP API; starts 
 jobctl ask --stop                                # stop the runner `ask` started
 ```
 
-`sql`, `retrieve` and `enqueue` exercise the same path the chat application
-uses (plain SQL, no HTTP). Credentials: `--env-file PATH` (with `DB_HOST`/
-`DB_USER`/`DB_PASSWORD`, database `--database`, default `main`) if given,
-else `DATABASE_URL` if set, else the Granite Manager admin login in
-`~/general_datebase/.env`, which can also create the `chats` row a message
-needs. `ask` reads `HTTP_ADDR` from the environment or `.env` and starts
-`claude-job-runner` from the same directory as `jobctl`, logging to
-`runner.log` in the current directory (`--no-start` to only talk to a
-running one).
+`retrieve` and `enqueue` use the queue the way the chat application does
+(plain SQL on `chats`/`chat_messages`, no HTTP). Credentials: `--env-file
+PATH` (with `DB_HOST`/`DB_USER`/`DB_PASSWORD`, database `--database`,
+default `main`) if given, else `DATABASE_URL` if set, else the Granite
+Manager admin login in `~/general_datebase/.env`. `ask` reads `HTTP_ADDR`
+from the environment or `.env` and starts `claude-job-runner` from the same
+directory as `jobctl`, logging to `runner.log` in the current directory
+(`--no-start` to only talk to a running one).
 
-## QuickBooks
-
-Invoices, payments and sales figures live in QuickBooks Online, not in the
-database. The chat application stores each company's QuickBooks connection
-in its `company` row (realm id, plus OAuth tokens encrypted with `AES_KEY`).
-The runner gives jobs the same read access the application has:
-
-1. Before a job starts, the daemon locks the asking company's row
-   (`SELECT ... FOR UPDATE`), decrypts its access token and, if it would
-   expire during the job (`CLAUDE_TIMEOUT_SECS` + 5 min), refreshes it with
-   Intuit and writes the rotated tokens back, encrypted exactly as the
-   application does. Holding the lock across the refresh keeps the runner and
-   the application from spending the same refresh token.
-2. The job gets only that access token and the realm id (`QBO_ACCESS_TOKEN`,
-   `QBO_REALM_ID`, `QBO_API_BASE`) plus who is asking (`QBO_COMPANY_ID`,
-   `QBO_USER_ID`, `QBO_REQUESTER_IS_ADMIN`). The token opens only that
-   company's QuickBooks account, so tenant isolation here does not rely on
-   the model. The AES key, the Intuit client secret, the refresh token and
-   the writable database login never reach a job.
-3. `jobctl-mcp` offers the `qbo_*` tools, ports of the application's own
-   QuickBooks code (`crates/jobctl/src/qbo.rs`):
-
-| Tool                     | Who     | What                                                                  |
-|--------------------------|---------|-----------------------------------------------------------------------|
-| `qbo_search_customers`   | all     | QuickBooks customers by name, with the CRM customers linked to them   |
-| `qbo_customer_invoices`  | all     | a customer's invoices, by CRM `customers.id` (matched by email, then name, if not linked) or QuickBooks id |
-| `qbo_invoice`            | all     | one invoice in full (lines, taxes, payments, addresses)               |
-| `qbo_sales_rep`          | all     | a rep's sales for a date range (class sales, customers and invoices); non-admins only their own |
-| `qbo_invoices_in_range`  | admins  | every invoice in a date range with totals and open balance            |
-| `qbo_class_sales`        | admins  | the Sales by Class report                                             |
-| `qbo_query`              | admins  | any read-only QuickBooks query (`select ... from Invoice ...`)        |
-| `qbo_report`             | admins  | any QuickBooks report as JSON (ProfitAndLoss, AgedReceivables, ...)   |
-
-Non-admins do not even see the admin tools, and only get invoices of
-customers linked to their company's CRM, as in the application's UI. Nothing
-can be written to QuickBooks, and unlike the application the tools do not
-save a newly matched `customers.qbo_id`.
-
-A company without a working connection (turned off, never connected, expired
-refresh token, Intuit unreachable) still runs the job, without the tools; its
-system prompt says why, so the answer can tell the user.
-
-Set `AES_KEY`, `QBO_CLIENT_ID`, `QBO_CLIENT_SECRET` and `QBO_ENV` to the chat
-application's values, in `/etc/claude-job-runner/secrets.env` (they are
-runner-only secrets). `QBO_ENV` must match the database the runner polls:
-production tokens only work with `QBO_ENV=production`. Do not point a
-runner at a copy of the production database with production tokens in it:
-refreshing them there would rotate, and so break, production's connection.
+QuickBooks needs nothing here: the API's `/v1/qbo/*` routes answer jobs with
+the asker's own QuickBooks access.
 
 ## Configuration
 
@@ -284,7 +239,8 @@ All settings come from the environment (a `.env` file is loaded if present).
 |----------------------------|--------------------|------------------------------------------------------|
 | `DATABASE_URL`             | required           | `mysql://…` (the database holding `chat_messages`)   |
 | `DB_MAX_CONNECTIONS`       | `5`                | Pool size                                            |
-| `AGENT_DATABASE_URL`       | (none)             | `DATABASE_URL` exported to jobs (read-only login); the runner's own is never passed on |
+| `GRANITE_API_URL`          | required           | The Granite Manager API; jobs use its MCP server `/v1/mcp` |
+| `AGENT_RUNNER_KEY`         | required           | Traded for each question's agent token; never reaches a job. Secret |
 | `WORKSPACE_ROOT`           | `./workspaces`     | Parent of per-job directories; `job-*` dirs are swept on start |
 | `POLL_INTERVAL_SECS`       | `5`                | Sleep between polls when the queue is empty          |
 | `MAX_CONCURRENT_JOBS`      | `1`                | Jobs (and `claude` processes) running at the same time |
@@ -300,24 +256,18 @@ All settings come from the environment (a `.env` file is loaded if present).
 | `CLAUDE_ALLOWED_DOMAINS`   | (none)             | Comma-separated hosts sandboxed shell commands may reach |
 | `CLAUDE_PERSIST_SESSIONS`  | `false`            | Keep transcripts for `claude --resume <session_id>`  |
 | `CLAUDE_CONFIG_DIR`        | (inherit)          | Separate Claude config dir for jobs                  |
-| `CLAUDE_MCP_CONFIG`        | (none)             | Extra MCP servers JSON file for jobs                 |
-| `JOBCTL_MCP_BIN`           | `jobctl-mcp` next to the daemon, if built | MCP server every job gets; without one, jobs have no MCP tools |
-| `AES_KEY`                  | (none)             | The chat application's 64-hex-char key; enables QuickBooks tools. Secret |
-| `QBO_CLIENT_ID`            | (none)             | Shared Intuit app, for companies without their own. Secret |
-| `QBO_CLIENT_SECRET`        | (none)             | See above. Secret                                    |
-| `QBO_ENV`                  | sandbox            | `production` for the production Intuit API           |
+| `CLAUDE_MCP_CONFIG`        | (none)             | Extra MCP servers JSON file for jobs (the API's is always there) |
 | `RUST_LOG`                 | `info`             | Log filter                                           |
 
 `CLAUDE_CONFIG_DIR` is worth setting if your personal `~/.claude` carries
 a `CLAUDE.md` or hooks you do not want every job to inherit. MCP servers are
-never inherited: jobs run with `--strict-mcp-config` and only `jobctl-mcp`
-plus the servers in `CLAUDE_MCP_CONFIG`, if any.
+never inherited: jobs run with `--strict-mcp-config` and only the API's
+server plus the servers in `CLAUDE_MCP_CONFIG`, if any.
 
 ## Resource usage
 
 The daemon itself is a few megabytes, and runs on a single-threaded tokio
-runtime to stay that way. Each job adds one `jobctl-mcp` process (about
-10 MB, single-threaded, one database connection opened on first use). Each running job is a `claude`
+runtime to stay that way. Each running job is a `claude`
 process, which is a bundled JavaScript runtime: roughly 150–250 MB resident
 for a short job, more on long ones with big transcripts, plus whatever the
 job's shell commands spawn (`npm install`, test suites, compilers). Size
@@ -326,9 +276,8 @@ commands. CPU is mostly idle: a session spends nearly all of its time
 waiting on the API.
 
 Jobs are started with `DISABLE_AUTOUPDATER=1` and
-`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, and with no MCP servers
-besides `jobctl-mcp` unless `CLAUDE_MCP_CONFIG` says otherwise, since most
-MCP servers are another Node process.
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`. The API's MCP server is
+remote (HTTP), so it adds no process.
 
 ## Development
 
@@ -354,12 +303,11 @@ src/
   workspace.rs  WorkspaceRoot (sweep) and Workspace (create / remove)
   claude.rs     ClaudeConfig, CliRunner (spawn + parse), ClaudeRunner trait
   worker.rs     polling loop with a semaphore bounding concurrent jobs
-  qbo.rs        QboBroker: per-job QuickBooks access tokens (decrypt, refresh, store)
+  granite.rs    GraniteApi: per-question agent tokens from the Granite API
   http.rs       Hyper API
   main.rs       wiring and graceful shutdown
 crates/
-  jobctl/       library (db, sql, chats, api, qbo) + the `jobctl` CLI
-  jobctl-mcp/   MCP server over the jobctl library
+  jobctl/       library (db, chats, api) + the `jobctl` CLI
 schema/         reference copy of the chat tables (source of truth: granite-webhooks)
 tests/          integration tests
 ```

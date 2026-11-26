@@ -28,7 +28,7 @@ help: ## List available targets
 
 # --- Local development -------------------------------------------------------
 
-build: ## Build the daemon, jobctl and jobctl-mcp
+build: ## Build the daemon and jobctl
 	cargo build --release --workspace
 
 test: ## Run unit + integration tests (needs DATABASE_URL in .env)

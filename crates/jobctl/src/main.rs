@@ -10,14 +10,12 @@ use std::time::{Duration, Instant};
 use jobctl::api::{self, Api};
 use jobctl::chats::{self, Message};
 use jobctl::db::{self, DEFAULT_DATABASE};
-use jobctl::sql;
 use sqlx::mysql::MySqlConnection;
 
 const USAGE: &str = "\
 jobctl - tools for the chat database and the runner
 
 usage:
-  jobctl sql [DB] [SQL...]                 run SQL (from args or stdin), print TSV
   jobctl retrieve [DB] [--json] CHAT       print a whole chat, oldest message first
   jobctl enqueue [DB] [--chat N] [--user N] [--no-wait] [--poll-secs S] [PROMPT...]
                                            insert an agentic message and wait for the answer
@@ -26,12 +24,12 @@ usage:
                                            post a job through the HTTP API and wait for it
   jobctl ask --stop                        stop a runner that `ask` started
 
-DB options (sql, retrieve, enqueue):
+DB options (retrieve, enqueue):
   --env-file PATH   read DB_HOST/DB_USER/DB_PASSWORD[/DB_PORT] from PATH
   --database NAME   database for env-file credentials (default: main)
   Without --env-file, DATABASE_URL is used when set, else ~/general_datebase/.env.
 
-A prompt or SQL left off the command line is read from stdin.
+A prompt left off the command line is read from stdin.
 `ask` reads HTTP_ADDR (environment or .env, default 127.0.0.1:8080) and
 ASK_CHAT_ID; unless --no-start is given it starts target/release/claude-job-runner
 from the current directory when nothing answers, logging to runner.log.";
@@ -48,7 +46,6 @@ async fn main() -> ExitCode {
     let command = argv.next();
     let rest: Vec<String> = argv.collect();
     let outcome = match command.as_deref() {
-        Some("sql") => cmd_sql(&rest).await,
         Some("retrieve") => cmd_retrieve(&rest).await,
         Some("enqueue") => cmd_enqueue(&rest).await,
         Some("ask") => cmd_ask(&rest).await,
@@ -66,14 +63,6 @@ async fn main() -> ExitCode {
 }
 
 // --- commands ------------------------------------------------------------------
-
-async fn cmd_sql(args: &[String]) -> Result<ExitCode, Failure> {
-    let args = Args::parse(args, DB_VALUES, &[])?;
-    let statement = text_or_stdin(&args.positional, "SQL (end with Ctrl-D):")?;
-    let mut conn = connect(&args).await?;
-    println!("{}", sql::query(&mut conn, &statement).await?);
-    Ok(ExitCode::SUCCESS)
-}
 
 async fn cmd_retrieve(args: &[String]) -> Result<ExitCode, Failure> {
     let args = Args::parse(args, DB_VALUES, &["--json"])?;

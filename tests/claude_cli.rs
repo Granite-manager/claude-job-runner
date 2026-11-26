@@ -27,6 +27,7 @@ async fn successful_run_is_parsed_and_invoked_correctly() {
 
     let report = runner
         .run(RunRequest {
+            question: claude_job_runner::job::MessageId::new(1),
             prompt: "ok:hello \"world\"",
             workspace: &ws,
             requester: Some(Requester {
@@ -75,13 +76,7 @@ async fn successful_run_is_parsed_and_invoked_correctly() {
         .iter()
         .position(|a| *a == "--append-system-prompt")
         .unwrap();
-    // The company isolation rule leads; the requester's identity follows.
-    assert!(args[system_index + 1].contains("`company_id = 7`"));
-    assert!(
-        args[system_index + 1..]
-            .iter()
-            .any(|a| a.contains("`users.id = 42`"))
-    );
+    assert!(args[system_index + 1].contains("user 42 of company 7"));
 }
 
 #[tokio::test]
@@ -91,6 +86,7 @@ async fn error_report_becomes_a_failed_outcome_with_partial_result() {
 
     let report = runner
         .run(RunRequest {
+            question: claude_job_runner::job::MessageId::new(1),
             prompt: "error",
             workspace: tmp.path(),
             requester: None,
@@ -115,6 +111,7 @@ async fn non_zero_exit_surfaces_stderr() {
 
     let err = runner
         .run(RunRequest {
+            question: claude_job_runner::job::MessageId::new(1),
             prompt: "crash",
             workspace: tmp.path(),
             requester: None,
@@ -138,6 +135,7 @@ async fn unparseable_output_is_reported() {
 
     let err = runner
         .run(RunRequest {
+            question: claude_job_runner::job::MessageId::new(1),
             prompt: "garbage",
             workspace: tmp.path(),
             requester: None,
@@ -163,6 +161,7 @@ async fn timeout_kills_the_process() {
     let started = Instant::now();
     let err = runner
         .run(RunRequest {
+            question: claude_job_runner::job::MessageId::new(1),
             prompt: "sleep:30",
             workspace: tmp.path(),
             requester: None,
@@ -184,6 +183,7 @@ async fn missing_binary_is_a_spawn_error() {
 
     let err = runner
         .run(RunRequest {
+            question: claude_job_runner::job::MessageId::new(1),
             prompt: "ok:x",
             workspace: tmp.path(),
             requester: None,
